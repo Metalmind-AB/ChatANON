@@ -1,0 +1,28 @@
+# Core dependencies
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# HTTP and async
+aiohttp
+httpx
+python-multipart
+websockets
+
+# Text processing
+tiktoken
+
+# Ollama integration
+ollama
+requests
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+
+# Development tools (optional)
+black
+rich
+python-dotenv

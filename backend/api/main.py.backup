@@ -1,0 +1,719 @@
+"""
+ChatANON FastAPI Application
+Main API server for text anonymization service
+"""
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict
+import asyncio
+import logging
+from datetime import datetime
+import json
+
+from ..core.ollama_client import OllamaClient
+from ..core.anonymizer import AnonymizerEngine
+from ..core.response_parser import ResponseParser
+from ..config import config
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL.upper()),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="ChatANON API",
+    description="Local text anonymization service using LLMs",
+    version="1.0.0"
+)
+
+# Configure CORS for local network access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize core components
+ollama_client = OllamaClient(
+    base_url=config.OLLAMA_BASE_URL,
+    model=config.OLLAMA_DEFAULT_MODEL,
+    timeout=config.OLLAMA_TIMEOUT,
+    max_retries=config.OLLAMA_MAX_RETRIES
+)
+anonymizer = AnonymizerEngine(
+    ollama_client,
+    chunk_size=config.DEFAULT_CHUNK_SIZE,
+    chunk_overlap=config.DEFAULT_CHUNK_OVERLAP
+)
+parser = ResponseParser()
+
+
+# Request/Response Models
+class AnonymizeRequest(BaseModel):
+    text: str = Field(..., description="Text to anonymize")
+    custom_instructions: Optional[str] = Field("", description="Custom anonymization instructions")
+    return_reasoning: bool = Field(True, description="Include reasoning in response")
+    stream: bool = Field(False, description="Stream the response")
+    model: Optional[str] = Field(None, description="Specific model to use")
+    temperature: float = Field(0.1, description="Model temperature")
+    chunk_parallel: bool = Field(False, description="Process chunks in parallel")
+
+
+class AnonymizeResponse(BaseModel):
+    anonymized_text: str
+    reasoning: Optional[Dict] = None
+    metadata: Dict
+
+
+class HealthResponse(BaseModel):
+    status: str
+    ollama_available: bool
+    models: List[str]
+    current_model: str
+
+
+class ModelSwitchRequest(BaseModel):
+    model: str = Field(..., description="Model to switch to")
+
+
+class EntityTypesResponse(BaseModel):
+    types: List[Dict[str, str]]
+    custom_types: List[str]
+
+
+class ManualTagRequest(BaseModel):
+    text: str = Field(..., description="Full text to process")
+    selected_text: str = Field(..., description="Text to tag")
+    entity_type: str = Field(..., description="Entity type to apply")
+    custom_instructions: Optional[str] = Field("", description="Custom instructions used")
+    current_detections: Optional[List[Dict]] = Field([], description="Current detections with original/replacement mappings")
+
+
+# API Routes
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "ChatANON",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "health": "/api/health",
+            "anonymize": "/api/anonymize",
+            "models": "/api/models",
+            "websocket": "/ws"
+        }
+    }
+
+
+@app.get("/api/health", response_model=HealthResponse)
+async def health_check():
+    """Check service health"""
+    try:
+        is_healthy = await ollama_client.health_check()
+        models = await ollama_client.list_models()
+        
+        return HealthResponse(
+            status="healthy" if is_healthy else "degraded",
+            ollama_available=is_healthy,
+            models=models,
+            current_model=ollama_client.model
+        )
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return HealthResponse(
+            status="unhealthy",
+            ollama_available=False,
+            models=[],
+            current_model="none"
+        )
+
+
+@app.post("/api/anonymize", response_model=AnonymizeResponse)
+async def anonymize_text(request: AnonymizeRequest):
+    """Anonymize text endpoint"""
+    try:
+        # Switch model if requested
+        if request.model and request.model != ollama_client.model:
+            success = await ollama_client.switch_model(request.model)
+            if not success:
+                raise HTTPException(status_code=400, detail=f"Model {request.model} not available")
+        
+        # Perform anonymization - all models support reasoning now
+        result = await anonymizer.anonymize(
+            text=request.text,
+            custom_instructions=request.custom_instructions,
+            return_reasoning=request.return_reasoning,
+            chunk_parallel=request.chunk_parallel
+        )
+        
+        return AnonymizeResponse(
+            anonymized_text=result['anonymized_text'],
+            reasoning=result.get('reasoning'),
+            metadata=result.get('metadata', {})
+        )
+        
+    except Exception as e:
+        logger.error(f"Anonymization failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/anonymize/stream")
+async def anonymize_text_stream(request: AnonymizeRequest):
+    """Stream anonymization response in real-time"""
+    
+    async def generate_stream():
+        try:
+            # Switch model if requested
+            if request.model and request.model != ollama_client.model:
+                success = await ollama_client.switch_model(request.model)
+                if not success:
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'Model {request.model} not available'})}\n\n"
+                    return
+            
+            # Send initial status
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Processing your request...'})}\n\n"
+            
+            # Use anonymizer's streaming method which handles chunking
+            full_response = ""
+            thinking_content = ""
+            anonymized_content = ""
+            in_thinking = False
+            
+            async for chunk_data in anonymizer.anonymize_stream(
+                text=request.text,
+                custom_instructions=request.custom_instructions,
+                return_reasoning=request.return_reasoning,
+                temperature=request.temperature,
+                top_p=0.9
+            ):
+                if chunk_data.get('type') == 'status':
+                    # Pass through status updates (chunk progress)
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                
+                elif chunk_data.get('type') == 'stream':
+                    content = chunk_data.get('content', '')
+                    full_response += content
+                    
+                    # Track thinking for all models when reasoning is requested
+                    # During streaming, we show the tagged content
+                    # At completion, we'll show the redacted version
+                    if request.return_reasoning:
+                        # Track thinking vs anonymized content for reasoning models
+                        if '<think>' in content:
+                            in_thinking = True
+                        elif '</think>' in content:
+                            in_thinking = False
+                            # Extract content after </think>
+                            parts = content.split('</think>')
+                            if len(parts) > 1:
+                                anonymized_content += parts[1]
+                                yield f"data: {json.dumps({'type': 'content', 'content': parts[1]})}\n\n"
+                        elif in_thinking:
+                            thinking_content += content
+                            yield f"data: {json.dumps({'type': 'thinking', 'content': content})}\n\n"
+                        else:
+                            anonymized_content += content
+                            yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
+                    else:
+                        # For non-reasoning models, all content is direct output
+                        anonymized_content += content
+                        yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
+                
+                elif chunk_data.get('type') == 'complete':
+                    # Convert reasoning data to JSON-serializable format
+                    reasoning = chunk_data.get('reasoning')
+                    if reasoning and 'detected_pii' in reasoning:
+                        # Convert PIIDetection objects to dictionaries
+                        reasoning['detected_pii'] = [
+                            {
+                                'type': pii.type,
+                                'original': pii.original,
+                                'replacement': pii.replacement,
+                                'confidence': pii.confidence,
+                                'explanation': pii.explanation,
+                                'position': getattr(pii, 'position', -1)
+                            } if hasattr(pii, '__dict__') else pii
+                            for pii in reasoning['detected_pii']
+                        ]
+                    
+                    # Send final complete response
+                    yield f"data: {json.dumps({'type': 'complete', 'anonymized_text': chunk_data.get('anonymized_text', anonymized_content), 'reasoning': reasoning})}\n\n"
+                    break
+                
+                elif chunk_data.get('type') == 'error':
+                    yield f"data: {json.dumps({'type': 'error', 'message': chunk_data.get('error', 'Unknown error')})}\n\n"
+                    break
+            
+        except Exception as e:
+            logger.error(f"Streaming anonymization failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+        }
+    )
+
+
+@app.post("/api/anonymize/batch")
+async def anonymize_batch(texts: List[str], custom_instructions: str = ""):
+    """Batch anonymization endpoint"""
+    try:
+        results = await anonymizer.batch_anonymize(
+            texts=texts,
+            custom_instructions=custom_instructions,
+            return_reasoning=False  # Simplified for batch
+        )
+        
+        return {
+            "results": [
+                {
+                    "original_index": i,
+                    "anonymized_text": r['anonymized_text'],
+                    "metadata": r.get('metadata', {})
+                }
+                for i, r in enumerate(results)
+            ],
+            "total": len(results)
+        }
+        
+    except Exception as e:
+        logger.error(f"Batch anonymization failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models")
+async def list_models():
+    """Apply manual tagging to selected text"""
+    try:
+        import re
+        
+        # Find all occurrences of the selected text
+        text = request.text
+        selected = request.selected_text.strip()  # Trim to improve matching
+        entity_type = request.entity_type
+        replace_all = request.dict().get('replace_all', False)
+        current_detections = request.current_detections or []
+        
+        logger.info(f"Manual tag request: selected='{selected}', entity_type={entity_type}, replace_all={replace_all}")
+        
+        # Type to placeholder mapping
+        type_mapping = {
+            'name': 'NAME',
+            'email': 'EMAIL',
+            'phone': 'PHONE',
+            'address': 'ADDRESS',
+            'ssn': 'SSN',
+            'org': 'ORG',
+            'birth-date': 'BIRTH_DATE',
+            'date': 'BIRTH_DATE',
+            'id': 'ID',
+            'proprietary': 'PROPRIETARY',
+            'location': 'LOCATION',
+            'product': 'PRODUCT',
+            'service': 'SERVICE',
+            'project': 'PROJECT'
+        }
+        
+        # Get the placeholder prefix for the new entity type
+        placeholder_prefix = type_mapping.get(entity_type, 'UNKNOWN')
+        
+        # Build a mapping of original text to placeholders from current detections
+        original_to_placeholder = {}
+        placeholder_to_original = {}
+        original_to_all_placeholders = {}  # Track ALL placeholders for each original text
+        
+        for detection in current_detections:
+            original = detection.get('original', '').strip()
+            replacement = detection.get('replacement', '')
+            
+            if original and replacement:
+                # Store mapping with exact text (case-insensitive key)
+                original_lower = original.lower()
+                # Only store the longest/most complete version of overlapping texts
+                # This prevents "Chen" from overwriting "Michael Chen"
+                if original_lower not in original_to_placeholder or len(original) > len(original_to_placeholder.get(original_lower, '')):
+                    original_to_placeholder[original_lower] = replacement
+                
+                placeholder_to_original[replacement] = original
+                
+                # Track ALL placeholders for this original text
+                if original_lower not in original_to_all_placeholders:
+                    original_to_all_placeholders[original_lower] = []
+                if replacement not in original_to_all_placeholders[original_lower]:
+                    original_to_all_placeholders[original_lower].append(replacement)
+        
+        # First, extract all existing placeholders and build a mapping
+        placeholder_pattern = re.compile(r'\[([A-Z_]+)_(\d+)\]')
+        existing_placeholders = {}
+        existing_numbers = {}
+        
+        # Track what numbers are used for each type
+        for match in placeholder_pattern.finditer(text):
+            ph_type = match.group(1)
+            ph_num = int(match.group(2))
+            full_placeholder = match.group(0)
+            
+            if ph_type not in existing_numbers:
+                existing_numbers[ph_type] = set()
+            existing_numbers[ph_type].add(ph_num)
+            existing_placeholders[full_placeholder] = (ph_type, ph_num)
+        
+        # Determine what we're actually replacing
+        # The user might have selected either original text or a placeholder
+        target_placeholder = None
+        target_original = None
+        
+        # Check if selected text is a placeholder
+        if placeholder_pattern.match(selected):
+            target_placeholder = selected
+            target_original = placeholder_to_original.get(selected, selected)
+        else:
+            # Selected text is original text
+            target_original = selected
+            target_placeholder = None
+        
+        # Determine the new placeholder to use
+        # Check if this text already has any placeholders (regardless of type)
+        lookup_key = target_original.lower() if target_original else selected.lower()
+        logger.info(f"Looking up '{lookup_key}' in mappings")
+        logger.info(f"Available mappings: {list(original_to_all_placeholders.keys())[:10]}")  # Show first 10
+        
+        existing_placeholders_for_text = original_to_all_placeholders.get(lookup_key, [])
+        logger.info(f"Found existing placeholders for '{lookup_key}': {existing_placeholders_for_text}")
+        
+        # Find if any of them match our desired type
+        existing_of_desired_type = None
+        for ph in existing_placeholders_for_text:
+            if ph.startswith(f'[{placeholder_prefix}_'):
+                existing_of_desired_type = ph
+                break
+        
+        if existing_of_desired_type:
+            # Reuse the existing placeholder for this text and type
+            new_placeholder = existing_of_desired_type
+            logger.info(f"Reusing existing placeholder {new_placeholder} for '{target_original}'")
+        else:
+            # Create a new placeholder with the next available number
+            if placeholder_prefix in existing_numbers:
+                new_num = max(existing_numbers[placeholder_prefix]) + 1
+            else:
+                new_num = 1
+            new_placeholder = f'[{placeholder_prefix}_{new_num}]'
+            logger.info(f"Creating new placeholder {new_placeholder} for '{target_original}'")
+        
+        # Replace the placeholder(s)
+        if replace_all:
+            # Find all placeholders that correspond to the same original text
+            placeholders_to_replace = []
+            if target_original:
+                for det in current_detections:
+                    if det.get('original', '').lower() == target_original.lower():
+                        placeholders_to_replace.append(det.get('replacement'))
+            
+            # Replace all of them with the new placeholder
+            if placeholders_to_replace:
+                tagged_text = text
+                for old_ph in placeholders_to_replace:
+                    if old_ph:
+                        tagged_text = tagged_text.replace(old_ph, new_placeholder)
+            else:
+                # No existing placeholders, replace the original text
+                pattern = re.compile(re.escape(selected), re.IGNORECASE)
+                tagged_text = pattern.sub(new_placeholder, text)
+        else:
+            # Replace only the selected placeholder or text
+            if target_placeholder:
+                logger.info(f"Replacing placeholder '{target_placeholder}' with '{new_placeholder}'")
+                tagged_text = text.replace(target_placeholder, new_placeholder, 1)
+            else:
+                # Replace the selected text itself
+                logger.info(f"Replacing text '{selected}' with '{new_placeholder}'")
+                pattern = re.compile(re.escape(selected), re.IGNORECASE)
+                tagged_text = pattern.sub(new_placeholder, text, count=1)
+                logger.info(f"Result: {tagged_text[:100]}...")
+        
+        # Now re-number all placeholders to ensure sequential ordering based on position
+        # Extract all placeholders with their positions
+        all_placeholders = []
+        for match in re.finditer(r'\[([A-Z_]+)_(\d+)\]', tagged_text):
+            all_placeholders.append({
+                'start': match.start(),
+                'end': match.end(),
+                'type': match.group(1),
+                'num': int(match.group(2)),
+                'full': match.group(0)
+            })
+        
+        # Sort by position in text
+        all_placeholders.sort(key=lambda x: x['start'])
+        
+        # Renumber within each type to maintain sequential order
+        type_counters = {}
+        renumbered_text = tagged_text
+        
+        # Process in reverse to maintain positions
+        for ph in reversed(all_placeholders):
+            ph_type = ph['type']
+            
+            # Get the new number for this type
+            if ph_type not in type_counters:
+                type_counters[ph_type] = []
+            
+            # Add to the list for this type (in reverse order since we're processing backwards)
+            type_counters[ph_type].insert(0, ph)
+        
+        # Now assign sequential numbers based on position
+        final_mappings = {}
+        for ph_type, placeholders in type_counters.items():
+            for i, ph in enumerate(placeholders, 1):
+                old_placeholder = ph['full']
+                new_placeholder = f'[{ph_type}_{i}]'
+                final_mappings[old_placeholder] = new_placeholder
+        
+        # Apply the renumbering
+        for old_ph, new_ph in final_mappings.items():
+            renumbered_text = renumbered_text.replace(old_ph, new_ph)
+        
+        # Build detections list with proper original text tracking
+        detections = []
+        
+        # First, rebuild the mapping from the current detections
+        placeholder_to_detection = {}
+        for detection in current_detections:
+            placeholder_to_detection[detection.get('replacement', '')] = detection
+        
+        # Now process all placeholders in the final text
+        for match in re.finditer(r'\[([A-Z_]+)_(\d+)\]', renumbered_text):
+            placeholder = match.group(0)
+            ph_type = match.group(1)
+            
+            # Try to find the original detection for this placeholder
+            original_text = selected  # Default to selected text for new ones
+            confidence = 1.0
+            explanation = f"Manually tagged as {entity_type}"
+            
+            # Check if this placeholder existed before (might have been renumbered)
+            for old_ph, new_ph in final_mappings.items():
+                if new_ph == placeholder and old_ph in placeholder_to_detection:
+                    # Found the original detection
+                    orig_detection = placeholder_to_detection[old_ph]
+                    original_text = orig_detection.get('original', selected)
+                    # Keep existing confidence if it was already detected
+                    if orig_detection.get('type') == ph_type:
+                        confidence = orig_detection.get('confidence', 1.0)
+                        explanation = orig_detection.get('explanation', explanation)
+                    break
+            
+            detections.append({
+                'type': ph_type.lower().replace('_', '-'),  # Convert back to lowercase type
+                'original': original_text,
+                'replacement': placeholder,
+                'confidence': confidence,
+                'explanation': explanation
+            })
+        
+        logger.info(f"Returning text (first 100 chars): {renumbered_text[:100]}...")
+        logger.info(f"Number of detections: {len(detections)}")
+        
+        return {
+            "anonymized_text": renumbered_text,
+            "tagged_text": renumbered_text,  # In this case they're the same
+            "detections": detections
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual tagging failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models")
+async def list_models():
+    """List available models"""
+    try:
+        models = await ollama_client.list_models()
+        return {
+            "models": models,
+            "current": ollama_client.model
+        }
+    except Exception as e:
+        logger.error(f"Failed to list models: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/models/switch")
+async def switch_model(request: ModelSwitchRequest):
+    """Switch to a different model"""
+    try:
+        success = await ollama_client.switch_model(request.model)
+        if success:
+            return {"message": f"Switched to model {request.model}"}
+        else:
+            raise HTTPException(status_code=400, detail=f"Failed to switch to {request.model}")
+    except Exception as e:
+        logger.error(f"Model switch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/validate")
+async def validate_anonymization(original: str, anonymized: str):
+    """Validate anonymization quality"""
+    try:
+        validation = await anonymizer.validate_anonymization(original, anonymized)
+        return validation
+    except Exception as e:
+        logger.error(f"Validation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# WebSocket for real-time anonymization
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time anonymization"""
+    await websocket.accept()
+    logger.info("WebSocket connection established")
+    
+    try:
+        while True:
+            # Receive message
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            if message.get('type') == 'anonymize':
+                # Stream anonymization
+                text = message.get('text', '')
+                custom_instructions = message.get('custom_instructions', '')
+                
+                # Build prompt - use default types only if no custom instructions
+                if custom_instructions:
+                    instructions = custom_instructions
+                else:
+                    instructions = ollama_client.DEFAULT_TYPES
+                
+                prompt = ollama_client.instruction_template.format(
+                    custom_instructions=instructions,
+                    input_text=text
+                )
+                
+                # Send acknowledgment
+                await websocket.send_json({
+                    'type': 'status',
+                    'message': 'Processing...'
+                })
+                
+                # Process with streaming
+                async for chunk in ollama_client._anonymize_stream(
+                    prompt=prompt,
+                    return_reasoning=True,
+                    temperature=0.1,
+                    top_p=0.9
+                ):
+                    await websocket.send_json(chunk)
+                
+            elif message.get('type') == 'ping':
+                await websocket.send_json({'type': 'pong'})
+                
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await websocket.close()
+
+
+# Custom instruction templates endpoint
+@app.get("/api/templates")
+async def get_instruction_templates():
+    """Get predefined instruction templates"""
+    return {
+        "templates": {
+            "gdpr": "Ensure compliance with GDPR. Be extra careful with EU citizen data. Redact all personal identifiers.",
+            "hipaa": "Follow HIPAA guidelines. Redact all Protected Health Information (PHI) including dates, medical record numbers, and health conditions.",
+            "pci": "Comply with PCI-DSS. Redact all payment card information including card numbers, CVV, and expiration dates.",
+            "minimal": "Only redact the most sensitive information like SSN and credit cards. Keep names and organizations if they're public figures.",
+            "maximum": "Redact all possible PII including names, dates, locations, organizations, and any potentially identifying information.",
+            "legal": "Preserve legal entity names and case numbers but redact personal information of individuals.",
+            "financial": "Redact account numbers, transaction IDs, and personal financial information but preserve institution names."
+        }
+    }
+
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "status_code": 500,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    logger.info("Starting ChatANON API...")
+    
+    # Check Ollama availability
+    is_healthy = await ollama_client.health_check()
+    if not is_healthy:
+        logger.warning("Ollama service not available or model not found")
+    else:
+        logger.info(f"Using model: {ollama_client.model}")
+        # Warm up the model to reduce first-request latency
+        logger.info("Warming up model for faster responses...")
+        warmed = await ollama_client.warm_up_model()
+        if warmed:
+            logger.info("Model warm-up completed successfully")
+        else:
+            logger.warning("Model warm-up failed, first request may be slow")
+    
+    logger.info("ChatANON API started successfully")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Shutting down ChatANON API...")
+    # Add any cleanup code here
+    logger.info("ChatANON API shut down complete")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Run the application
+    uvicorn.run(
+        app,
+        host="0.0.0.0",  # Allow network access
+        port=8080,
+        log_level="info"
+    )
