@@ -18,6 +18,8 @@
     "@types/react-dom": "^19.1.7",
     "@types/react-router-dom": "^5.3.3",
     "axios": "^1.11.0",
+    "jspdf": "^3.0.1",
+    "jspdf-autotable": "^5.0.2",
     "monaco-editor": "^0.52.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",

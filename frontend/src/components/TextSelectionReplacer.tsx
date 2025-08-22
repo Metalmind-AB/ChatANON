@@ -26,6 +26,7 @@ interface TextSelectionReplacerProps {
 
 interface SelectionInfo {
   text: string;
+  start: number;
   x: number;
   y: number;
   width: number;
@@ -58,12 +59,42 @@ const TextSelectionReplacer: React.FC<TextSelectionReplacerProps> = ({
 
     const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
-    const containerRect = containerRef.current.getBoundingClientRect();
+    
+    // Find the position of the selection in the text
+    const fullText = containerRef.current.textContent || '';
+    let selectionStart = -1;
+    
+    // Try to find the exact position by walking through the text
+    const selectedTextNormalized = selectedText.replace(/\s+/g, ' ');
+    const fullTextNormalized = fullText.replace(/\s+/g, ' ');
+    
+    // Find all occurrences of the selected text
+    const occurrences: number[] = [];
+    let searchFrom = 0;
+    while (true) {
+      const pos = fullTextNormalized.indexOf(selectedTextNormalized, searchFrom);
+      if (pos === -1) break;
+      occurrences.push(pos);
+      searchFrom = pos + 1;
+    }
+    
+    // If there's only one occurrence, use it
+    if (occurrences.length === 1) {
+      selectionStart = occurrences[0];
+    } else if (occurrences.length > 1) {
+      // Try to determine which occurrence based on the range
+      const preSelectionRange = document.createRange();
+      preSelectionRange.selectNodeContents(containerRef.current);
+      preSelectionRange.setEnd(range.startContainer, range.startOffset);
+      const preSelectionText = preSelectionRange.toString();
+      selectionStart = preSelectionText.replace(/\s+/g, ' ').length;
+    }
 
     if (rect.width === 0 || rect.height === 0) return;
 
     setSelection({
       text: selectedText,
+      start: selectionStart,
       x: rect.left + rect.width / 2,
       y: rect.bottom + 5, // Position below the selection
       width: rect.width,
@@ -156,45 +187,106 @@ const TextSelectionReplacer: React.FC<TextSelectionReplacerProps> = ({
       }
       
       // Create the new text with the replacement
-      const newText = anonymizedText.replace(selection.text, existingPlaceholder);
+      // We need to be more careful about which occurrence we're replacing
+      // Count occurrences before the selection to determine which one to replace
+      let occurrenceToReplace = 0;
+      let searchPos = 0;
       
-      // Create updated detections array
-      const newDetections = [...detections];
-      const existingIndex = newDetections.findIndex(d => 
-        d.original === selection.text && d.replacement.startsWith(`[${placeholderType}_`)
-      );
+      // Find all occurrences of the selected text
+      const occurrences: number[] = [];
+      while ((searchPos = anonymizedText.indexOf(selection.text, searchPos)) !== -1) {
+        occurrences.push(searchPos);
+        searchPos += selection.text.length;
+      }
       
-      if (existingIndex === -1) {
-        // Find the correct position to insert based on where it appears in the text
-        const position = newText.indexOf(existingPlaceholder);
-        
-        // Count how many replacements appear before this position
-        let insertIndex = 0;
-        for (let i = 0; i < newDetections.length; i++) {
-          const detectionPos = newText.indexOf(newDetections[i].replacement);
-          if (detectionPos !== -1 && detectionPos < position) {
-            insertIndex = i + 1;
-          } else {
+      // If we can't find the text, something's wrong
+      if (occurrences.length === 0) {
+        console.warn('Selected text not found in anonymized text:', selection.text);
+        return;
+      }
+      
+      // For now, replace the first untagged occurrence
+      // TODO: Better logic to determine which specific occurrence was selected
+      let newText = anonymizedText;
+      if (occurrences.length === 1) {
+        // Only one occurrence, simple case
+        newText = anonymizedText.replace(selection.text, existingPlaceholder);
+      } else {
+        // Multiple occurrences - replace the first one that isn't already tagged
+        // Check if any occurrence is not yet replaced with a placeholder
+        let replaced = false;
+        for (const pos of occurrences) {
+          const beforePos = anonymizedText.substring(Math.max(0, pos - 20), pos);
+          const afterPos = anonymizedText.substring(pos + selection.text.length, Math.min(anonymizedText.length, pos + selection.text.length + 20));
+          
+          // Check if this position is not already surrounded by brackets (indicating it's already a placeholder)
+          if (!beforePos.includes('[') && !afterPos.startsWith(']')) {
+            // This occurrence hasn't been tagged yet, replace it
+            newText = anonymizedText.substring(0, pos) + existingPlaceholder + anonymizedText.substring(pos + selection.text.length);
+            replaced = true;
             break;
           }
         }
         
-        // Insert at the correct position
+        if (!replaced) {
+          // All occurrences seem to be tagged, just replace the first one
+          newText = anonymizedText.replace(selection.text, existingPlaceholder);
+        }
+      }
+      
+      // Create updated detections array - always add the detection for manual replacements
+      const newDetections = [...detections];
+      
+      // Find where this replacement appears in the new text
+      const replacementPosition = newText.indexOf(existingPlaceholder);
+      
+      // Count how many times we've already tracked this exact replacement
+      const existingCount = newDetections.filter(d => 
+        d.original === selection.text && 
+        d.replacement === existingPlaceholder
+      ).length;
+      
+      // Count how many times this placeholder appears in the new text
+      let placeholderCount = 0;
+      let searchPos2 = 0;
+      while ((searchPos2 = newText.indexOf(existingPlaceholder, searchPos2)) !== -1) {
+        placeholderCount++;
+        searchPos2 += existingPlaceholder.length;
+      }
+      
+      // Only add a new detection if we have more occurrences than we're tracking
+      if (placeholderCount > existingCount) {
+        // Find the correct position to insert based on order in text
+        let insertIndex = 0;
+        
+        // Simple approach: count how many replacements come before this one
+        for (let i = 0; i < newDetections.length; i++) {
+          const detectionPos = newText.indexOf(newDetections[i].replacement);
+          if (detectionPos !== -1 && detectionPos < replacementPosition) {
+            insertIndex = i + 1;
+          }
+        }
+        
+        // Find the maximum existing index to ensure we don't conflict
+        let maxIndex = -1;
+        for (const detection of newDetections) {
+          if (detection.i !== undefined && detection.i > maxIndex) {
+            maxIndex = detection.i;
+          }
+        }
+        
+        // Insert at the correct position with a new unique index
+        const newIndex = maxIndex + 1;
         newDetections.splice(insertIndex, 0, {
-          type: selectedEntityType,
+          type: selectedEntityType.toUpperCase(),  // Use ALL CAPS to match bot format
           original: selection.text,
           replacement: existingPlaceholder,
           confidence: 1.0,
-          explanation: `Manually tagged as ${selectedEntityType}`,
-          i: insertIndex  // Add index for consistency
+          explanation: `Manually tagged as ${selectedEntityType.toUpperCase()}`,
+          i: newIndex  // Use a new index that won't conflict
         });
         
-        // Update indices for all items after the insertion
-        for (let i = insertIndex + 1; i < newDetections.length; i++) {
-          if (newDetections[i].i !== undefined) {
-            newDetections[i].i = i;
-          }
-        }
+        // DO NOT update indices for existing items - this would break inactive tracking!
       }
       
       onReplace(selection.text, newText, newDetections);
@@ -275,11 +367,11 @@ const TextSelectionReplacer: React.FC<TextSelectionReplacerProps> = ({
           
           // Insert the new detection
           newDetections.splice(insertIndex, 0, {
-            type: selectedEntityType,
+            type: selectedEntityType.toUpperCase(),  // Use ALL CAPS to match bot format
             original: selection.text,
             replacement: existingPlaceholder,
             confidence: 1.0,
-            explanation: `Manually tagged as ${selectedEntityType}`,
+            explanation: `Manually tagged as ${selectedEntityType.toUpperCase()}`,
             i: insertIndex
           });
           

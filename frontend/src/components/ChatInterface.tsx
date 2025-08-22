@@ -457,6 +457,7 @@ const ChatInterface: React.FC = () => {
       newText: newText?.substring(0, 50),
       messageId: messages[messageIndex]?.id,
       newDetections: newDetections?.length,
+      detectionDetails: newDetections
     });
     
     // Update both content and detections
@@ -466,9 +467,11 @@ const ChatInterface: React.FC = () => {
         ...messages[messageIndex].reasoning,
         detected_pii: newDetections
       };
+      console.log('[ChatInterface] Updating message with new detections:', newDetections.length);
     }
     
     updateMessage(messages[messageIndex].id, updates);
+    console.log('[ChatInterface] Message updated');
   }, [messages, updateMessage]);
 
   const handleReplaceAll = useCallback((messageIndex: number, originalText: string, newText: string, newDetections?: any[]) => {

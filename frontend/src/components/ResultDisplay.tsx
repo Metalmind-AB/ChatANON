@@ -17,7 +17,8 @@ import {
   Slider,
   Stack,
   IconButton,
-  Tooltip,
+  Menu,
+  MenuItem,
 } from '@mui/material';
 import {
   ExpandMore as ExpandMoreIcon,
@@ -46,8 +47,12 @@ import {
   AccountBalance as AccountIcon,
   LocalHospital as MedicalIcon,
   ExpandLess as ExpandLessIcon,
+  FileDownload as FileDownloadIcon,
+  PictureAsPdf as PictureAsPdfIcon,
+  TableChart as TableChartIcon,
 } from '@mui/icons-material';
 import { ResultDisplayProps, PIIDetection } from '../types';
+import { exportToCSV, exportToPDF, prepareExportData } from '../utils/exportUtils';
 
 interface ResultDisplayExtendedProps extends ResultDisplayProps {
   inactiveOccurrences?: Set<number>;
@@ -70,6 +75,7 @@ const ResultDisplay: React.FC<ResultDisplayExtendedProps> = ({
   const [confidenceThreshold, setConfidenceThreshold] = useState<number>(0);
   const [sliderActive, setSliderActive] = useState<boolean>(true);
   const [manualOverrides, setManualOverrides] = useState<boolean>(false);
+  const [exportMenuAnchor, setExportMenuAnchor] = useState<null | HTMLElement>(null);
   
   // Count detections (backend already sends one per occurrence)
   const countOccurrences = () => {
@@ -116,6 +122,57 @@ const ResultDisplay: React.FC<ResultDisplayExtendedProps> = ({
     }
   };
 
+  // Export handlers
+  const handleExportClick = (event: React.MouseEvent<HTMLElement>) => {
+    event.stopPropagation();
+    event.preventDefault();
+    setExportMenuAnchor(event.currentTarget);
+  };
+
+  const handleExportClose = () => {
+    setExportMenuAnchor(null);
+  };
+
+  const handleExportCSV = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    event.preventDefault();
+    
+    // Debug: Log what we're exporting
+    console.log('[Export] Detections being exported:', {
+      count: reasoning.detected_pii?.length,
+      detections: reasoning.detected_pii,
+      inactiveOccurrences: Array.from(inactiveOccurrences)
+    });
+    
+    const exportData = prepareExportData(
+      originalText,
+      anonymizedText,
+      reasoning.detected_pii,
+      inactiveOccurrences,
+      reasoning.processing_time,
+      reasoning.confidence_avg,
+      reasoning.chunks_processed
+    );
+    exportToCSV(exportData);
+    handleExportClose();
+  };
+
+  const handleExportPDF = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    event.preventDefault();
+    const exportData = prepareExportData(
+      originalText,
+      anonymizedText,
+      reasoning.detected_pii,
+      inactiveOccurrences,
+      reasoning.processing_time,
+      reasoning.confidence_avg,
+      reasoning.chunks_processed
+    );
+    exportToPDF(exportData);
+    handleExportClose();
+  };
+
   if (!reasoning) {
     return null;
   }
@@ -160,15 +217,80 @@ const ResultDisplay: React.FC<ResultDisplayExtendedProps> = ({
 
       {/* Sensitive Information Detections */}
       {reasoning.detected_pii.length > 0 && (
-        <Accordion defaultExpanded={false}>
-          <AccordionSummary expandIcon={<ExpandMoreIcon />}>
-            <Box display="flex" alignItems="center" gap={1}>
-              <SecurityIcon color="primary" />
-              <Typography variant="h6">
-                Sensitive Information ({occurrenceCounts.active} active + {occurrenceCounts.inactive} inactive)
+        <Box position="relative" sx={{ 
+          '& .MuiAccordion-root': {
+            borderRadius: '4px 4px 0 0',  // Round only top corners
+            '&:before': {
+              display: 'none',  // Remove the default top border
+            }
+          },
+          '& .MuiAccordion-root.Mui-expanded': {
+            borderRadius: '4px 4px 0 0',  // Keep top corners rounded when expanded
+          }
+        }}>
+          {/* Export button positioned absolutely */}
+          <Box sx={{ position: 'absolute', right: 48, top: 8, zIndex: 1 }}>
+            <IconButton
+              size="small"
+              onClick={handleExportClick}
+              sx={{ 
+                border: '1px solid rgba(0, 0, 0, 0.23)',
+                borderRadius: 1,
+                px: 1.5,
+                py: 0.5,
+                bgcolor: 'background.paper',
+                position: 'relative',
+                zIndex: 2,  // Ensure button is above accordion
+                '&:hover': {
+                  borderColor: 'primary.main',
+                  bgcolor: 'rgba(25, 118, 210, 0.04)',
+                  zIndex: 3  // Even higher on hover
+                }
+              }}
+            >
+              <FileDownloadIcon fontSize="small" />
+              <Typography variant="body2" sx={{ ml: 0.5, mr: 0.5, fontSize: '0.875rem' }}>
+                Export
               </Typography>
-            </Box>
-          </AccordionSummary>
+              <ExpandMoreIcon fontSize="small" sx={{ ml: 0.5 }} />
+            </IconButton>
+            <Menu
+              anchorEl={exportMenuAnchor}
+              open={Boolean(exportMenuAnchor)}
+              onClose={handleExportClose}
+              anchorOrigin={{
+                vertical: 'bottom',
+                horizontal: 'right',
+              }}
+              transformOrigin={{
+                vertical: 'top',
+                horizontal: 'right',
+              }}
+            >
+              <MenuItem onClick={handleExportCSV}>
+                <ListItemIcon>
+                  <TableChartIcon fontSize="small" />
+                </ListItemIcon>
+                <ListItemText>Export as CSV</ListItemText>
+              </MenuItem>
+              <MenuItem onClick={handleExportPDF}>
+                <ListItemIcon>
+                  <PictureAsPdfIcon fontSize="small" />
+                </ListItemIcon>
+                <ListItemText>Export as PDF</ListItemText>
+              </MenuItem>
+            </Menu>
+          </Box>
+          
+          <Accordion defaultExpanded={false}>
+            <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+              <Box display="flex" alignItems="center" gap={1}>
+                <SecurityIcon color="primary" />
+                <Typography variant="h6">
+                  Sensitive Information ({occurrenceCounts.active} active + {occurrenceCounts.inactive} inactive)
+                </Typography>
+              </Box>
+            </AccordionSummary>
           <AccordionDetails>
             {/* Confidence Threshold Slider */}
             <Box sx={{ px: 2, pb: 2, pt: 1, borderBottom: 1, borderColor: 'divider' }}>
@@ -311,6 +433,7 @@ const ResultDisplay: React.FC<ResultDisplayExtendedProps> = ({
             </List>
           </AccordionDetails>
         </Accordion>
+        </Box>
       )}
 
       {/* Reasoning Process */}
